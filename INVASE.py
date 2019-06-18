@@ -25,44 +25,43 @@ import tensorflow as tf
 import numpy as np
 from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score
 
-#%% Define PVS class
-class PVS():
+#%% Define INVASE class
+class INVASE():
     
     # 1. Initialization
     '''
     x_train: training samples
     data_type: Syn1 to Syn 6
     '''
-    def __init__(self, x_train, data_type):
-        self.latent_dim1 = 100      # Dimension of actor (generator) network
-        self.latent_dim2 = 200      # Dimension of critic (discriminator) network
+    def __init__(self, x_train, data_type, n_epoch, is_logging_enabled=True, learning_rate=0.0001):
+        self.is_logging_enabled = is_logging_enabled
         
-        self.batch_size = 1000      # Batch size
-        self.epochs = 10000         # Epoch size (large epoch is needed due to the policy gradient framework)
-        self.lamda = 0.1            # Hyper-parameter for the number of selected features 
+        self.batch_size = min(1000, x_train.shape[0])      # Batch size
+        self.epochs = n_epoch        # Epoch size (large epoch is needed due to the policy gradient framework)
+        self.tau = 0.1             # Hyper-parameter for the number of selected features 
 
         self.input_shape = x_train.shape[1]     # Input dimension
         
-        # Actionvation. (For Syn1 and 2, relu, others, selu)
-        self.activation = 'relu' if data_type in ['Syn1','Syn2'] else 'selu'       
+        # Activation. (For Syn1 and 2, relu, others, selu)
+        self.activation = 'relu' if data_type in ['Syn1','Syn2'] else 'selu' # Why SeLu?
 
-        # Use Adam optimizer with learning rate = 0.0001
-        optimizer = Adam(0.0001)
+        # Use Adam optimize
+        optimizer = Adam(lr=learning_rate)
         
-        # Build and compile the discriminator (critic)
-        self.discriminator = self.build_discriminator()
+        # Build and compile the predictor (critic)
+        self.predictor = self.build_base_network()
         # Use categorical cross entropy as the loss
-        self.discriminator.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['acc'])
+        self.predictor.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['acc'])
 
-        # Build the generator (actor)
-        self.generator = self.build_generator()
+        # Build the selector (actor)
+        self.selector = self.build_selector()
         # Use custom loss (my loss)
-        self.generator.compile(loss=self.my_loss, optimizer=optimizer)
+        self.selector.compile(loss=self.my_loss, optimizer=optimizer)
 
-        # Build and compile the value function
-        self.valfunction = self.build_valfunction()
+        # Build and compile the baseline
+        self.baseline = self.build_base_network()
         # Use categorical cross entropy as the loss
-        self.valfunction.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['acc'])
+        self.baseline.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['acc'])
 
     #%% Custom loss definition
     def my_loss(self, y_true, y_pred):
@@ -73,9 +72,9 @@ class PVS():
         # Put all three in y_true 
         # 1. selected probability
         sel_prob = y_true[:,:d]
-        # 2. discriminator output
+        # 2. predictor output
         dis_prob = y_true[:,d:(d+2)]
-        # 3. valfunction output
+        # 3. baseline output
         val_prob = y_true[:,(d+2):(d+4)]
         # 4. ground truth
         y_final = y_true[:,(d+4):]        
@@ -90,72 +89,39 @@ class PVS():
         Reward = Reward1 - Reward2
 
         # B. Policy gradient loss computation. 
-        loss1 = Reward * tf.reduce_sum( sel_prob * K.log(y_pred + 1e-8) + (1-sel_prob) * K.log(1-y_pred + 1e-8), axis = 1) - self.lamda * tf.reduce_mean(y_pred, axis = 1)
+        loss1 = Reward * tf.reduce_sum(sel_prob * K.log(y_pred + 1e-8) + (1-sel_prob) * K.log(1-y_pred + 1e-8), axis = 1) - self.tau * tf.reduce_mean(y_pred, axis = 1)
         
         # C. Maximize the loss1
         loss = tf.reduce_mean(-loss1)
 
         return loss
 
-    #%% Generator (Actor)
-    def build_generator(self):
+    #%% Selector (Actor)
+    def build_selector(self):
 
         model = Sequential()
         
-        model.add(Dense(100, activation=self.activation, name = 's/dense1', kernel_regularizer=regularizers.l2(1e-3), input_dim = self.input_shape))
-        model.add(Dense(100, activation=self.activation, name = 's/dense2', kernel_regularizer=regularizers.l2(1e-3)))
-        model.add(Dense(self.input_shape, activation = 'sigmoid', name = 's/dense3', kernel_regularizer=regularizers.l2(1e-3)))
-        
-        model.summary()
+        model.add(Dense(100, activation=self.activation, name='s/dense1', kernel_regularizer=regularizers.l2(1e-3), input_dim = self.input_shape))
+        model.add(Dense(100, activation=self.activation, name='s/dense2', kernel_regularizer=regularizers.l2(1e-3)))
+        model.add(Dense(self.input_shape, activation = 'sigmoid', name='s/dense3', kernel_regularizer=regularizers.l2(1e-3)))
 
         feature = Input(shape=(self.input_shape,), dtype='float32')
-        select_prob = model(feature)
+        selection_prob = model(feature)
 
-        return Model(feature, select_prob)
-
-    #%% Discriminator (Critic)
-    def build_discriminator(self):
+        return Model(feature, selection_prob)
+        
+    #%% Baseline & predictor
+    def build_base_network(self):
 
         model = Sequential()
                 
-        model.add(Dense(200, activation=self.activation, name = 'dense1', kernel_regularizer=regularizers.l2(1e-3), input_dim = self.input_shape)) 
-        model.add(BatchNormalization())     # Use Batch norm for preventing overfitting
+        model.add(Dense(200, activation=self.activation, name='dense1', kernel_regularizer=regularizers.l2(1e-3), input_dim = self.input_shape)) 
+        model.add(BatchNormalization())
         model.add(Dense(200, activation=self.activation, name = 'dense2', kernel_regularizer=regularizers.l2(1e-3)))
         model.add(BatchNormalization())
         model.add(Dense(2, activation ='softmax', name = 'dense3', kernel_regularizer=regularizers.l2(1e-3)))
         
-        model.summary()
-        
-        # There are two inputs to be used in the discriminator
-        # 1. Features
-        feature = Input(shape=(self.input_shape,), dtype='float32')
-        # 2. Selected Features
-        select = Input(shape=(self.input_shape,), dtype='float32')         
-        
-        # Element-wise multiplication
-        model_input = Multiply()([feature, select])
-        prob = model(model_input)
-
-        return Model([feature, select], prob)
-        
-    #%% Value Function
-    def build_valfunction(self):
-
-        model = Sequential()
-                
-        model.add(Dense(200, activation=self.activation, name = 'v/dense1', kernel_regularizer=regularizers.l2(1e-3), input_dim = self.input_shape)) 
-        model.add(BatchNormalization())     # Use Batch norm for preventing overfitting
-        model.add(Dense(200, activation=self.activation, name = 'v/dense2', kernel_regularizer=regularizers.l2(1e-3)))
-        model.add(BatchNormalization())
-        model.add(Dense(2, activation ='softmax', name = 'v/dense3', kernel_regularizer=regularizers.l2(1e-3)))
-        
-        model.summary()
-        
-        # There are one inputs to be used in the value function
-        # 1. Features
         feature = Input(shape=(self.input_shape,), dtype='float32')       
-        
-        # Element-wise multiplication
         prob = model(feature)
 
         return Model(feature, prob)
@@ -172,47 +138,48 @@ class PVS():
         
         return samples
 
-    #%% Training procedure
+  #%% Training procedure
     def train(self, x_train, y_train):
 
-        # For each epoch (actually iterations)
+        # For each epoch (actually iterations!)
         for epoch in range(self.epochs):
 
-            #%% Train Discriminator
+            #%% Train predictor
             # Select a random batch of samples
             idx = np.random.randint(0, x_train.shape[0], self.batch_size)
             x_batch = x_train[idx,:]
             y_batch = y_train[idx,:]
 
             # Generate a batch of probabilities of feature selection
-            gen_prob = self.generator.predict(x_batch)
+            sel_prob = self.selector.predict(x_batch)
             
-            # Sampling the features based on the generated probability
-            sel_prob = self.Sample_M(gen_prob)     
+            # Sampling the features based on the generated probability and overlaying mask on input
+            sel_mask = self.Sample_M(sel_prob)
+            sel_feat = Multiply()([x_batch, sel_mask])     
             
-            # Compute the prediction of the critic based on the sampled features (used for generator training)
-            dis_prob = self.discriminator.predict([x_batch, sel_prob])
+            # Compute the prediction of the critic based on the sampled features (used for selector training)
+            dis_prob = self.predictor.predict(sel_feat)
 
-            # Train the discriminator
-            d_loss = self.discriminator.train_on_batch([x_batch, sel_prob], y_batch)
+            # Train the predictor
+            d_loss = self.predictor.train_on_batch(sel_feat, y_batch)
 
-            #%% Train Valud function
+            #%% Train the baseline
 
-            # Compute the prediction of the critic based on the sampled features (used for generator training)
-            val_prob = self.valfunction.predict(x_batch)
+            # Compute the prediction of the critic based on the sampled features (used for selector training)
+            val_prob = self.baseline.predict(x_batch)
 
-            # Train the discriminator
-            v_loss = self.valfunction.train_on_batch(x_batch, y_batch)
+            # Train the predictor
+            v_loss = self.baseline.train_on_batch(x_batch, y_batch)
             
-            #%% Train Generator
+            #%% Train selector
             # Use three things as the y_true: sel_prob, dis_prob, and ground truth (y_batch)
             y_batch_final = np.concatenate( (sel_prob, np.asarray(dis_prob), np.asarray(val_prob), y_batch), axis = 1 )
 
-            # Train the generator
-            g_loss = self.generator.train_on_batch(x_batch, y_batch_final)
+            # Train the selector
+            g_loss = self.selector.train_on_batch(x_batch, y_batch_final)
 
             #%% Plot the progress
-            dialog = 'Epoch: ' + str(epoch) + ', d_loss (Acc)): ' + str(d_loss[1]) + ', v_loss (Acc): ' + str(v_loss[1]) + ', g_loss: ' + str(np.round(g_loss,4))
+            dialog = 'Epoch: '+str(epoch)+', d_loss (Acc)): '+str(d_loss[1])+', v_loss (Acc): '+str(v_loss[1])+', g_loss: '+str(np.round(g_loss,4))
 
             if epoch % 100 == 0:
                 print(dialog)
@@ -269,20 +236,20 @@ if __name__ == '__main__':
     x_train, y_train, g_train, x_test, y_test, g_test = create_data(data_type, data_out)
 
     #%% 
-    # 1. PVS Class call
-    PVS_Alg = PVS(x_train, data_type)
+    # 1. INVASE Class call
+    INVASE_Alg = INVASE(x_train, data_type)
     
     # 2. Algorithm training
-    PVS_Alg.train(x_train, y_train)
+    INVASE_Alg.train(x_train, y_train)
     
     # 3. Get the selection probability on the testing set
-    Sel_Prob_Test = PVS_Alg.output(x_test)
+    Sel_Prob_Test = INVASE_Alg.output(x_test)
     
     # 4. Selected features
     score = 1.*(Sel_Prob_Test > 0.5)
     
     # 5. Prediction
-    val_predict, dis_predict = PVS_Alg.get_prediction(x_test, score)
+    val_predict, dis_predict = INVASE_Alg.get_prediction(x_test, score)
     
     #%% Performance Metrics
     def performance_metric(score, g_truth):
@@ -306,7 +273,6 @@ if __name__ == '__main__':
         return np.mean(Temp_TPR), np.mean(Temp_FDR), np.std(Temp_TPR), np.std(Temp_FDR)
     
     #%% Output
-        
     TPR_mean, FDR_mean, TPR_std, FDR_std = performance_metric(score, g_test)
         
     print('TPR mean: ' + str(np.round(TPR_mean,1)) + '\%, ' + 'TPR std: ' + str(np.round(TPR_std,1)) + '\%, '  )
@@ -317,18 +283,18 @@ if __name__ == '__main__':
 
     for i in range(20):
         
-        # different teat seed
+        # different test seed
         test_seed = i+2
         _, _, _, x_test, y_test, _ = create_data(data_type, data_out)  
                 
         # 1. Get the selection probability on the testing set
-        Sel_Prob_Test = PVS_Alg.output(x_test)
+        Sel_Prob_Test = INVASE_Alg.output(x_test)
     
         # 2. Selected features
         score = 1.*(Sel_Prob_Test > 0.5)
     
         # 3. Prediction
-        val_predict, dis_predict = PVS_Alg.get_prediction(x_test, score)
+        val_predict, dis_predict = INVASE_Alg.get_prediction(x_test, score)
         
         # 4. Prediction Results
         Predict_Out[i,0,0] = roc_auc_score(y_test[:,1], val_predict[:,1])
